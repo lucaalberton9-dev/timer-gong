@@ -173,18 +173,21 @@ button { cursor: pointer; }
     return buf;
   }
   var ctx = null, master = null, gongShort = null, gongEnd = null;
-  function ensureAudio() {
-    if (!ctx) {
+  function initAudio() {
+    if (ctx) return;
+    try {
       var AC = window.AudioContext || window.webkitAudioContext;
-      ctx = new AC();
-      master = ctx.createGain();
-      master.connect(ctx.destination);
-      gongShort = makeGong(ctx, 238, 6, 1.5);
-      gongEnd = makeGong(ctx, 168, 13, 3.4);
-    }
+      if (!AC) return;
+      var c = new AC();
+      var m = c.createGain();
+      m.connect(c.destination);
+      gongShort = makeGong(c, 238, 6, 1.5);
+      gongEnd = makeGong(c, 168, 13, 3.4);
+      ctx = c; master = m;
+    } catch (e) { ctx = null; }
     try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-    return ctx.resume ? ctx.resume() : Promise.resolve();
   }
+  function audioOK() { return !!ctx && ctx.state === 'running'; }
 
   /* ---------- sequenza ---------- */
   var tl = null;
@@ -202,10 +205,11 @@ button { cursor: pointer; }
     return 0;
   }
 
-  /* ---------- motore (tempo guidato dall'orologio audio) ---------- */
+  /* ---------- motore (tempo dall'orologio di sistema, gong in aggiunta) ---------- */
   var mode = 'idle'; /* idle | running | paused | done */
-  var anchor = 0, elapsed = 0, bus = null, live = [], timer = null, wl = null;
-  function currentP() { return mode === 'running' ? ctx.currentTime - anchor : elapsed; }
+  var t0 = 0, elapsed = 0, bus = null, live = [], timer = null, wl = null, scheduled = false, retry = 0;
+  function now() { return performance.now() / 1000; }
+  function currentP() { return mode === 'running' ? now() - t0 : elapsed; }
 
   function playAt(buf, when, gain) {
     var s = ctx.createBufferSource();
@@ -217,16 +221,20 @@ button { cursor: pointer; }
     live.push(s);
     s.onended = function () { var k = live.indexOf(s); if (k > -1) live.splice(k, 1); };
   }
-  function schedule(p0) {
+  /* programma tutti i gong ancora da suonare, rispetto alla posizione attuale */
+  function schedule() {
+    if (!bus || !audioOK() || !gongShort) return;
+    var p = currentP(), base = ctx.currentTime;
     tl.events.forEach(function (e) {
-      if (e.p < p0 - 1e-4) return;
-      var when = anchor + e.p;
+      if (e.p < p - 0.05) return;
+      var when = base + Math.max(0, e.p - p);
       if (e.kind === 'end') { playAt(gongEnd, when, 1); playAt(gongEnd, when + 3.4, 0.6); }
       else playAt(gongShort, when, 1);
     });
+    scheduled = true;
   }
   function killBus() {
-    if (!bus) return;
+    if (!bus || !ctx) { bus = null; return; }
     var b = bus, srcs = live.slice();
     bus = null; live = [];
     var t = ctx.currentTime;
@@ -255,18 +263,26 @@ button { cursor: pointer; }
   function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
 
   function begin() {
-    anchor = ctx.currentTime - elapsed;
-    bus = ctx.createGain();
-    bus.connect(master);
+    initAudio();
+    t0 = now() - elapsed;
     mode = 'running';
-    schedule(elapsed);
+    scheduled = false; retry = 0;
+    if (ctx) {
+      try {
+        bus = ctx.createGain();
+        bus.connect(master);
+        var r = ctx.resume();
+        if (r && r.then) r.then(function () { if (mode === 'running' && !scheduled) schedule(); }, function () {});
+        if (audioOK()) schedule();
+      } catch (e) {}
+    }
     lockScreen();
     startTimer();
     render();
     tick();
   }
   function pause() {
-    elapsed = ctx.currentTime - anchor;
+    elapsed = currentP();
     mode = 'paused';
     killBus(); stopTimer(); unlockScreen();
     render();
@@ -288,7 +304,13 @@ button { cursor: pointer; }
   }
   function tick() {
     var p = currentP();
-    if (mode === 'running' && p >= tl.T) { finish(); return; }
+    if (mode === 'running') {
+      if (p >= tl.T) { finish(); return; }
+      if (!scheduled && ctx) {
+        if (audioOK()) schedule();
+        else if (++retry % 10 === 0) { try { ctx.resume(); } catch (e) {} }
+      }
+    }
     paint(p);
   }
 
@@ -389,23 +411,23 @@ button { cursor: pointer; }
   $('main').addEventListener('click', function () {
     if (mode === 'idle' || mode === 'done') {
       if (mode === 'done') { killBus(); }
-      var go = function () { tl = buildTL(); elapsed = 0; begin(); };
-      ensureAudio().then(go);
+      tl = buildTL(); elapsed = 0; begin();
     } else if (mode === 'running') {
       pause();
     } else if (mode === 'paused') {
-      ensureAudio().then(begin);
+      begin();
     }
   });
   $('reset').addEventListener('click', resetAll);
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible' && mode === 'running') {
-      if (ctx && ctx.state !== 'running') ctx.resume();
+      if (ctx && ctx.state !== 'running') { try { ctx.resume(); } catch (e) {} }
       lockScreen();
       tick();
     }
   });
 
+  setTimeout(initAudio, 400);
   tl = buildTL();
   renderChips();
   render();
