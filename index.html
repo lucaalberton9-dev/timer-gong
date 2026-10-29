@@ -98,6 +98,7 @@ button { cursor: pointer; }
 .main svg { display: block; }
 .reset { margin-top: 18px; height: 44px; padding: 0 16px; background: transparent; border: 0; color: var(--muted); font-size: 15px; }
 .reset:hover { color: var(--fg); }
+.status { margin: 4px 0 0; max-width: 320px; font-size: 12px; line-height: 1.45; color: var(--muted); text-wrap: balance; }
 </style>
 
 </head>
@@ -112,17 +113,21 @@ button { cursor: pointer; }
   </div>
   <div class="zone" id="zone">
     <div class="chips" id="chips"></div>
-    <p class="note" id="note">minuti per pratica · svuota un campo per toglierlo</p>
+    <p class="note" id="note">minuti per pratica · svuota per togliere · tocca il cerchio per il gong</p>
   </div>
   <button class="main" id="main" type="button"></button>
   <button class="reset" id="reset" type="button">Azzera</button>
+  <p class="status" id="status" role="status" hidden></p>
+  <audio id="player" preload="auto" playsinline></audio>
+  <audio id="tester" src="gong.wav" preload="auto" playsinline></audio>
 </main>
 
+<script src="audio.js"></script>
 <script>
 (function () {
   'use strict';
   var $ = function (id) { return document.getElementById(id); };
-  var KEY = 'timer-gong-v2', PREP = 5;
+  var KEY = 'timer-gong-v2', PREP = 5, A = window.TimerAudio;
 
   function clampMin(v) {
     if (!isFinite(v)) return 2;
@@ -140,125 +145,157 @@ button { cursor: pointer; }
     return m + ':' + (s < 10 ? '0' : '') + s;
   }
   function fmtMin(v) { return String(+v.toFixed(2)).replace('.', ','); }
-
-  /* ---------- gong: sintesi in campioni ---------- */
-  var SR = 11025, MAXAUDIO = 3600;
-  var PARTIALS = [[1, 1, 1], [1.004, 0.75, 0.95], [2.756, 0.5, 0.7], [2.766, 0.32, 0.65], [5.404, 0.3, 0.45], [8.933, 0.16, 0.3], [13.34, 0.08, 0.2]];
-  function synthGong(f0, dur, tau) {
-    var n = Math.floor(SR * dur), d = new Float32Array(n), TWO = 2 * Math.PI, i, k;
-    for (k = 0; k < PARTIALS.length; k++) {
-      var r = PARTIALS[k][0], a = PARTIALS[k][1], T = tau * PARTIALS[k][2];
-      if (f0 * r > SR * 0.45) continue;
-      var w = TWO * f0 * r / SR, bloom = r > 2 ? 0.06 : 0.004;
-      for (i = 0; i < n; i++) {
-        var t = i / SR;
-        d[i] += a * Math.sin(w * i) * Math.exp(-t / T) * (1 - Math.exp(-t / bloom));
-      }
-    }
-    var seed = 1, y = 0, nn = Math.min(n, Math.floor(SR * 0.05));
-    for (i = 0; i < nn; i++) {
-      seed = (seed * 16807) % 2147483647;
-      var x = (seed / 2147483647) * 2 - 1;
-      y += 0.25 * (x - y);
-      var tt = i / SR;
-      d[i] += y * 0.9 * Math.exp(-tt / 0.012) * (1 - Math.exp(-tt / 0.001));
-    }
-    var peak = 0;
-    for (i = 0; i < n; i++) { var v = Math.abs(d[i]); if (v > peak) peak = v; }
-    var g = peak > 0 ? 0.9 / peak : 1, fade = Math.floor(SR * 0.4);
-    for (i = 0; i < n; i++) {
-      d[i] *= g;
-      if (i > n - fade) d[i] *= (n - i) / fade;
-    }
-    return d;
-  }
-  var gongCache = null;
-  function gongs() {
-    if (!gongCache) gongCache = { short: synthGong(238, 6, 1.5), end: synthGong(168, 13, 3.4) };
-    return gongCache;
-  }
-
-  /* ---------- file WAV in memoria ---------- */
-  function newWav(n) {
-    var buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
-    function w(o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
-    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
-    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-    w(36, 'data'); v.setUint32(40, n * 2, true);
-    return { buf: buf, pcm: new Int16Array(buf, 44, n) };
-  }
-  function wavUrl(buf) { return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })); }
-  function addTo(pcm, src, at, gain) {
-    var s0 = Math.round(at * SR), n = pcm.length;
-    for (var i = 0; i < src.length && s0 + i < n; i++) {
-      var v = pcm[s0 + i] + src[i] * gain * 30000;
-      pcm[s0 + i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
-    }
-  }
+  function now() { return performance.now() / 1000; }
 
   /* ---------- sequenza ---------- */
   var tl = null;
-  function buildTL() {
-    var durs = steps.map(function (m) { return Math.round(m * 60); });
-    var cum = [0];
-    durs.forEach(function (d) { cum.push(cum[cum.length - 1] + d); });
-    var T = PREP + cum[cum.length - 1];
-    var events = durs.map(function (_, i) { return { p: PREP + cum[i], kind: 'start' }; });
-    events.push({ p: T, kind: 'end' });
-    return { durs: durs, cum: cum, T: T, events: events };
-  }
+  function buildTL() { return A.timeline(steps, PREP); }
   function indexAt(q) {
     for (var i = tl.durs.length - 1; i >= 0; i--) { if (q >= tl.cum[i]) return i; }
     return 0;
   }
 
-  /* ---------- audio: l'intera sessione come un unico file, gong inclusi ---------- */
-  /* iOS: tratta la pagina come un lettore audio, cosi' l'interruttore silenzio non la zittisce (anche da icona Home) */
-  function mediaSession() {
+  /* ---------- audio ----------
+     La sessione e' un unico file audio con i gong gia' al loro posto.
+     Fonti, in ordine: 'sw' = session.wav generato dal service worker (indirizzo normale),
+     'blob' = file generato nella pagina. Se una fonte fallisce si passa alla successiva.
+     Se nessuna funziona, il timer continua e una riga sotto il pulsante dice perche'. */
+  var player = $('player'), tester = $('tester');
+  var standalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+  var forced = (location.hash.match(/^#audio-(sw|blob)$/) || [])[1];
+  var sources = [], srcIdx = -1, gen = 0, audioOn = false, failures = [], blobUrl = null;
+  var selfPause = false, lastLoad = -10;
+
+  function playbackSession() {
     try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   }
-  mediaSession();
-  var aud = null, audUrl = null, testAud = null;
-  function freeAudio() {
-    if (aud) {
-      try { aud.pause(); aud.removeAttribute('src'); aud.load(); } catch (e) {}
-      aud = null;
-    }
-    if (audUrl) { try { URL.revokeObjectURL(audUrl); } catch (e) {} audUrl = null; }
+  playbackSession();
+
+  function status(msg) { var el = $('status'); el.textContent = msg || ''; el.hidden = !msg; }
+
+  function freeBlob() { if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch (e) {} blobUrl = null; } }
+  function urlFor(kind) {
+    if (kind === 'sw') return 'session.wav?p=' + PREP + '&s=' + steps.join(',');
+    freeBlob();
+    var buf = A.sessionWav(steps, PREP);
+    if (!buf) return null;
+    blobUrl = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    return blobUrl;
   }
-  function prepareAudio() {
-    mediaSession();
-    freeAudio();
-    if (tl.T > MAXAUDIO) return;
+  function planSources() {
+    var hasSW = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+    var order = forced ? [forced] : (standalone ? ['sw', 'blob'] : ['blob', 'sw']);
+    return order.filter(function (k) { return k !== 'sw' || hasSW; });
+  }
+  function loadSource(i) {
+    srcIdx = i; gen++;
+    var url = null;
+    try { url = urlFor(sources[i]); } catch (e) { url = null; }
+    if (!url) { failures.push(sources[i] + ': non generato'); return false; }
+    selfPause = true; lastLoad = now();
+    player.src = url;
+    try { player.load(); } catch (e) {}
+    return true;
+  }
+  function loadFirstFrom(i) {
+    for (; i < sources.length; i++) { if (loadSource(i)) return true; }
+    return false;
+  }
+  function seekTo(t) {
+    if (t <= 0.05) return;
+    if (player.readyState >= 1) { try { player.currentTime = t; } catch (e) {} return; }
+    var g = gen;
+    player.addEventListener('loadedmetadata', function once() {
+      player.removeEventListener('loadedmetadata', once);
+      if (g !== gen) return;
+      try { player.currentTime = currentP(); } catch (e) {}
+    });
+  }
+  function playFrom(t) {
+    if (!audioOn) return;
+    seekTo(t);
+    selfPause = false;
+    var g = gen;
     try {
-      var g = gongs(), wav = newWav(Math.ceil((tl.T + 17) * SR));
-      tl.events.forEach(function (e) {
-        if (e.kind === 'end') { addTo(wav.pcm, g.end, e.p, 1); addTo(wav.pcm, g.end, e.p + 3.4, 0.6); }
-        else addTo(wav.pcm, g.short, e.p, 1);
+      var pr = player.play();
+      if (pr && pr.catch) pr.catch(function (e) {
+        if (e && e.name === 'AbortError') return;
+        fail(g, sources[srcIdx] + ': ' + ((e && e.name) || 'errore'));
       });
-      audUrl = wavUrl(wav.buf);
-      aud = new Audio(audUrl);
-      aud.preload = 'auto';
-      aud.setAttribute('playsinline', '');
-    } catch (e) { aud = null; }
+    } catch (e) { fail(g, sources[srcIdx] + ': ' + (e.name || 'errore')); }
   }
-  function playAudio(from) {
-    if (!aud) return;
-    try {
-      if (from > 0) aud.currentTime = from;
-      var pr = aud.play();
-      if (pr && pr.catch) pr.catch(function () {});
-    } catch (e) {}
+  function fail(g, reason) {
+    if (g !== gen || !audioOn) return;
+    failures.push(reason);
+    if (loadFirstFrom(srcIdx + 1)) {
+      if (mode === 'running') playFrom(currentP());
+      return;
+    }
+    audioOn = false;
+    status('Gong non riprodotto · ' + failures.join(' · '));
+  }
+  function stopAudio() {
+    gen++; audioOn = false; selfPause = true;
+    try { player.pause(); } catch (e) {}
+    try { player.removeAttribute('src'); player.load(); } catch (e) {}
+    freeBlob();
   }
 
-  /* ---------- motore (il tempo segue l'audio quando suona, altrimenti l'orologio) ---------- */
+  player.addEventListener('error', function () {
+    if (!audioOn || !player.getAttribute('src')) return;
+    fail(gen, sources[srcIdx] + ': errore ' + (player.error ? player.error.code : '?'));
+  });
+  // Se il sistema ferma l'audio (chiamata, controlli della schermata di blocco), si ferma anche il timer,
+  // dal punto in cui il suono si e' interrotto: cosi' tempo e gong non si sfasano mai.
+  player.addEventListener('pause', function () {
+    if (selfPause || mode !== 'running' || player.ended || !audioOn) return;
+    if (now() - lastLoad < 1.5) return;
+    pause(player.currentTime > 0.05 ? player.currentTime : undefined);
+  });
+
+  /* gong di prova: tocco sul cerchio a timer fermo, file statico gong.wav */
+  tester.addEventListener('error', function () {
+    status('Gong di prova non caricato · errore ' + (tester.error ? tester.error.code : '?'));
+  });
+  function testGong() {
+    playbackSession();
+    status('');
+    try { tester.currentTime = 0; } catch (e) {}
+    try {
+      var pr = tester.play();
+      if (pr && pr.catch) pr.catch(function (e) {
+        if (e && e.name === 'AbortError') return;
+        status('Gong di prova non riprodotto · ' + ((e && e.name) || 'errore'));
+      });
+    } catch (e) { status('Gong di prova non riprodotto · ' + (e.name || 'errore')); }
+  }
+
+  /* controlli nella schermata di blocco e nel Centro di Controllo */
+  function mediaState() {
+    try { if (navigator.mediaSession) navigator.mediaSession.playbackState = mode === 'running' ? 'playing' : 'paused'; } catch (e) {}
+  }
+  try {
+    if ('mediaSession' in navigator) {
+      if (window.MediaMetadata) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: 'Timer Gong', artist: 'Meditazione',
+          artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }]
+        });
+      }
+      navigator.mediaSession.setActionHandler('play', function () { if (mode === 'paused') begin(); });
+      navigator.mediaSession.setActionHandler('pause', function () { if (mode === 'running') pause(); });
+    }
+  } catch (e) {}
+
+  /* ---------- motore: il tempo segue l'audio quando suona, altrimenti l'orologio ---------- */
   var mode = 'idle'; /* idle | running | paused | done */
   var t0 = 0, elapsed = 0, timer = null, wl = null;
-  function now() { return performance.now() / 1000; }
   function currentP() {
     if (mode !== 'running') return elapsed;
-    if (aud && !aud.paused && !aud.ended && aud.readyState >= 2 && aud.currentTime > 0.05) return aud.currentTime;
+    if (audioOn && !player.paused && !player.ended && player.readyState >= 2 && player.currentTime > 0.05) {
+      t0 = now() - player.currentTime;
+      return player.currentTime;
+    }
     return now() - t0;
   }
   function lockScreen() {
@@ -275,35 +312,51 @@ button { cursor: pointer; }
   function startTimer() { stopTimer(); timer = setInterval(tick, 100); }
   function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
 
+  function startSession() {
+    stopAudio();
+    tl = buildTL(); elapsed = 0; failures = [];
+    status('');
+    playbackSession();
+    sources = planSources();
+    audioOn = tl.T <= A.MAXAUDIO && loadFirstFrom(0);
+    if (!audioOn && tl.T <= A.MAXAUDIO) status('Gong non riprodotto · ' + (failures.join(' · ') || 'nessuna fonte audio'));
+    begin();
+  }
   function begin() {
     t0 = now() - elapsed;
     mode = 'running';
-    playAudio(elapsed);
+    playFrom(elapsed);
     lockScreen();
     startTimer();
     render();
+    mediaState();
     tick();
   }
-  function pause() {
-    elapsed = currentP();
+  function pause(at) {
+    elapsed = typeof at === 'number' ? Math.min(at, tl.T) : currentP();
     mode = 'paused';
-    if (aud) { try { aud.pause(); } catch (e) {} }
+    selfPause = true;
+    try { player.pause(); } catch (e) {}
     stopTimer(); unlockScreen();
     render();
+    mediaState();
     paint(elapsed);
   }
   function finish() {
-    mode = 'done';
+    mode = 'done';          // l'audio continua: i due gong finali risuonano fino in fondo
     elapsed = tl.T;
     stopTimer(); unlockScreen();
     render();
+    mediaState();
     paint(tl.T);
   }
   function resetAll() {
-    freeAudio(); stopTimer(); unlockScreen();
+    stopAudio(); stopTimer(); unlockScreen();
     mode = 'idle'; elapsed = 0;
     tl = buildTL();
+    status('');
     render();
+    mediaState();
     paint(0);
   }
   function tick() {
@@ -368,12 +421,12 @@ button { cursor: pointer; }
     $('reset').style.visibility = mode === 'idle' ? 'hidden' : 'visible';
     $('zone').style.visibility = mode === 'idle' ? 'visible' : 'hidden';
   }
-  function changed() {
-    save(); tl = buildTL(); paint(0);
-    $('note').textContent = tl.T > MAXAUDIO
+  function updateNote() {
+    $('note').textContent = tl.T > A.MAXAUDIO
       ? 'Oltre 60 minuti il gong non è disponibile'
-      : 'minuti per pratica · svuota un campo per toglierlo';
+      : 'minuti per pratica · svuota per togliere · tocca il cerchio per il gong';
   }
+  function changed() { save(); tl = buildTL(); paint(0); updateNote(); }
 
   function renderChips() {
     var box = $('chips');
@@ -382,7 +435,7 @@ button { cursor: pointer; }
       var inp = document.createElement('input');
       inp.type = 'text'; inp.inputMode = 'decimal'; inp.className = 'chip'; inp.id = 'chip-' + i;
       inp.value = fmtMin(v);
-      inp.setAttribute('aria-label', 'Durata in minuti, pratica ' + (i + 1));
+      inp.setAttribute('aria-label', 'Durata in minuti, pratica ' + (i + 1) + '. Svuota il campo per toglierla.');
       inp.addEventListener('focus', function () { inp.select(); });
       inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') inp.blur(); });
       inp.addEventListener('change', function () {
@@ -412,31 +465,12 @@ button { cursor: pointer; }
   }
 
   $('main').addEventListener('click', function () {
-    if (mode === 'idle' || mode === 'done') {
-      tl = buildTL(); elapsed = 0;
-      prepareAudio();
-      begin();
-    } else if (mode === 'running') {
-      pause();
-    } else if (mode === 'paused') {
-      begin();
-    }
+    if (mode === 'idle' || mode === 'done') startSession();
+    else if (mode === 'running') pause();
+    else if (mode === 'paused') begin();
   });
   $('reset').addEventListener('click', resetAll);
-  $('dial').addEventListener('click', function () {
-    if (mode !== 'idle') return;
-    mediaSession();
-    try {
-      if (testAud) { testAud.pause(); testAud = null; }
-      var d = gongs().short, wav = newWav(d.length), url;
-      for (var i = 0; i < d.length; i++) wav.pcm[i] = d[i] * 30000;
-      url = wavUrl(wav.buf);
-      testAud = new Audio(url);
-      testAud.onended = function () { try { URL.revokeObjectURL(url); } catch (e) {} };
-      var pr = testAud.play();
-      if (pr && pr.catch) pr.catch(function () {});
-    } catch (e) {}
-  });
+  $('dial').addEventListener('click', function () { if (mode === 'idle') testGong(); });
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible' && mode === 'running') {
       lockScreen();
@@ -444,10 +478,10 @@ button { cursor: pointer; }
     }
   });
 
-  setTimeout(gongs, 400);
   tl = buildTL();
   renderChips();
   render();
+  updateNote();
   paint(0);
 })();
 </script>
