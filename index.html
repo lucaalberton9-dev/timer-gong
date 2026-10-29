@@ -214,6 +214,11 @@ button { cursor: pointer; }
   }
 
   /* ---------- audio: l'intera sessione come un unico file, gong inclusi ---------- */
+  /* iOS: tratta la pagina come un lettore audio, cosi' l'interruttore silenzio non la zittisce (anche da icona Home) */
+  function mediaSession() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  }
+  mediaSession();
   var aud = null, audUrl = null, testAud = null;
   function freeAudio() {
     if (aud) {
@@ -223,6 +228,7 @@ button { cursor: pointer; }
     if (audUrl) { try { URL.revokeObjectURL(audUrl); } catch (e) {} audUrl = null; }
   }
   function prepareAudio() {
+    mediaSession();
     freeAudio();
     if (tl.T > MAXAUDIO) return;
     try {
@@ -419,6 +425,7 @@ button { cursor: pointer; }
   $('reset').addEventListener('click', resetAll);
   $('dial').addEventListener('click', function () {
     if (mode !== 'idle') return;
+    mediaSession();
     try {
       if (testAud) { testAud.pause(); testAud = null; }
       var d = gongs().short, wav = newWav(d.length), url;
