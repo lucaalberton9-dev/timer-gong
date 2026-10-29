@@ -166,7 +166,10 @@ button { cursor: pointer; }
   var sources = [], srcIdx = -1, gen = 0, audioOn = false, failures = [], blobUrl = null;
   var selfPause = false, lastLoad = -10;
 
+  // Prova: nessuna impostazione della sessione audio. Su alcune versioni di iOS
+  // audioSession.type = 'playback' zittisce le app aggiunte alla Home. Con #playback si riattiva.
   function playbackSession() {
+    if (location.hash !== '#playback') return;
     try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
   }
   playbackSession();
